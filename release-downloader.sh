@@ -12,7 +12,7 @@ fi
 
 # 版本选择
 version=$(gum spin --spinner dot --title "获取版本列表..." -- \
-    gh release list -R "$repo" --limit 50 | \
+    gh release list -R "$repo" --limit 50 --json tagName,name,isLatest,publishedAt --jq '.[] | "\(.tagName)  \(.publishedAt)  \(.name)  \(if .isLatest then "(Latest)" else "" end)"' | \
     gum filter --header "按版本号或关键字筛选" | awk '{print $1}')
 [ -z "$version" ] && { gum style --foreground 196 "错误：未选择版本！"; exit 1; }
 
