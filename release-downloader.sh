@@ -1,7 +1,106 @@
 #!/bin/bash
 set -euo pipefail
 
-# SHA256 计算工具兼容（macOS 用 shasum，Linux 用 sha256sum）
+# 语言检测：支持 --lang zh|en 参数，或通过 LANG 环境变量自动检测
+SCRIPT_LANG=""
+args=()
+for arg in "$@"; do
+  if [ "$SCRIPT_LANG" = "__next__" ]; then
+    SCRIPT_LANG="$arg"
+    continue
+  fi
+  if [ "$arg" = "--lang" ]; then
+    SCRIPT_LANG="__next__"
+    continue
+  fi
+  args+=("$arg")
+done
+[ "$SCRIPT_LANG" = "__next__" ] && SCRIPT_LANG=""
+set -- "${args[@]+"${args[@]}"}"
+
+if [ -z "$SCRIPT_LANG" ]; then
+  case "${LANG:-}" in
+    zh_*) SCRIPT_LANG="zh" ;;
+    *)    SCRIPT_LANG="en" ;;
+  esac
+fi
+
+# i18n 文案定义
+if [ "$SCRIPT_LANG" = "zh" ]; then
+  MSG_RESOLVED_REPO="已解析仓库"
+  MSG_MULTI_MATCH="找到多个匹配仓库，请选择："
+  MSG_ERR_RESOLVE="错误：无法解析仓库 '%s'，请使用 owner/repo 格式"
+  MSG_INPUT_REPO="GitHub 仓库名称"
+  MSG_ERR_REPO_REQUIRED="错误：仓库名称不能为空"
+  MSG_FETCHING_RELEASES="获取版本列表..."
+  MSG_ERR_NO_RELEASES="错误：未找到任何 Release 版本"
+  MSG_SELECT_VERSION="按版本号或关键字筛选"
+  MSG_ERR_NO_VERSION="错误：未选择版本"
+  MSG_FETCHING_ASSETS="获取资源列表..."
+  MSG_ERR_NO_ASSETS="错误：该版本没有可下载的资源文件"
+  MSG_FILTER_HINT="Enter 选择 / Tab 多选 / 输入关键字过滤"
+  MSG_ERR_NO_SELECTED="错误：未选择资源文件"
+  MSG_SELECTED="已选择资源文件："
+  MSG_INPUT_DIR="下载路径（回车默认当前目录）"
+  MSG_ERR_MKDIR="错误：无法创建目录 '%s'"
+  MSG_ERR_NOT_WRITABLE="错误：路径 '%s' 不可写"
+  MSG_SKIPPED="跳过已存在且完整的文件："
+  MSG_ALL_EXIST="所有文件已存在且完整，无需下载！"
+  MSG_INTERRUPTED="检测到中断，正在清理..."
+  MSG_DOWNLOADING="下载中..."
+  MSG_DL_FAILED="下载失败！可能原因："
+  MSG_DL_NETWORK="  - 网络连接失败"
+  MSG_DL_NOT_FOUND="  - 资源文件不存在"
+  MSG_DL_DISK="  - 磁盘空间不足（剩余：%s）"
+  MSG_DIAG_API="网络诊断：GitHub API 访问失败"
+  MSG_OK="[OK] 下载完成！共下载 %d 个文件到：%s"
+  MSG_WARN_SIZE="[WARN] 文件大小校验失败："
+  MSG_FAIL_SHA="[FAIL] SHA256 校验失败："
+  MSG_SHA_OK="[SHA256] 校验通过：%d 个文件"
+  MSG_SIZE_OK="[INFO] 文件大小校验通过（该 Release 未提供 checksums 文件，已跳过 SHA256 校验）"
+  MSG_SKIP_COUNT="[SKIP] 跳过已存在文件：%d 个"
+  MSG_EXPECTED="期望"
+  MSG_ACTUAL="实际"
+  MSG_FILE_MISSING="文件不存在"
+else
+  MSG_RESOLVED_REPO="Resolved repo"
+  MSG_MULTI_MATCH="Multiple matches found, select one:"
+  MSG_ERR_RESOLVE="Error: cannot resolve repo '%s', use owner/repo format"
+  MSG_INPUT_REPO="GitHub Repository"
+  MSG_ERR_REPO_REQUIRED="Error: repository name is required"
+  MSG_FETCHING_RELEASES="Fetching releases..."
+  MSG_ERR_NO_RELEASES="Error: no releases found"
+  MSG_SELECT_VERSION="Select version:"
+  MSG_ERR_NO_VERSION="Error: no version selected"
+  MSG_FETCHING_ASSETS="Fetching assets..."
+  MSG_ERR_NO_ASSETS="Error: no downloadable assets in this release"
+  MSG_FILTER_HINT="Enter: select / Tab: multi-select / Type: filter"
+  MSG_ERR_NO_SELECTED="Error: no assets selected"
+  MSG_SELECTED="Selected assets:"
+  MSG_INPUT_DIR="Download path (Enter for current dir)"
+  MSG_ERR_MKDIR="Error: cannot create directory '%s'"
+  MSG_ERR_NOT_WRITABLE="Error: '%s' is not writable"
+  MSG_SKIPPED="Skipped (already complete):"
+  MSG_ALL_EXIST="All files already exist and are complete."
+  MSG_INTERRUPTED="Interrupted, cleaning up..."
+  MSG_DOWNLOADING="Downloading..."
+  MSG_DL_FAILED="Download failed. Possible causes:"
+  MSG_DL_NETWORK="  - Network error"
+  MSG_DL_NOT_FOUND="  - Asset not found"
+  MSG_DL_DISK="  - Disk full (free: %s)"
+  MSG_DIAG_API="Diagnostic: GitHub API unreachable"
+  MSG_OK="[OK] Downloaded %d file(s) to: %s"
+  MSG_WARN_SIZE="[WARN] Size verification failed:"
+  MSG_FAIL_SHA="[FAIL] SHA256 verification failed:"
+  MSG_SHA_OK="[SHA256] Verified: %d file(s)"
+  MSG_SIZE_OK="[INFO] Size OK (no checksums file in release, SHA256 skipped)"
+  MSG_SKIP_COUNT="[SKIP] Skipped %d existing file(s)"
+  MSG_EXPECTED="expected"
+  MSG_ACTUAL="actual"
+  MSG_FILE_MISSING="file missing"
+fi
+
+# SHA256 计算
 compute_sha256() {
   if command -v sha256sum &>/dev/null; then
     sha256sum "$1" | awk '{print $1}'
@@ -12,88 +111,90 @@ compute_sha256() {
   fi
 }
 
-# 仓库名称解析：支持 owner/repo 和 owner_repo 两种格式
+# 仓库名称解析
 resolve_repo() {
   local input="$1"
 
-  # 已经是 owner/repo 格式，直接返回
   if [[ "$input" == */* ]]; then
     echo "$input"
     return 0
   fi
 
-  # 尝试将第一个 _ 替换为 /（GitHub 用户名不允许下划线）
   if [[ "$input" == *_* ]]; then
     local candidate="${input/_//}"
-    # 通过 GitHub API 验证仓库是否存在
     if gh api "repos/$candidate" --jq '.full_name' &>/dev/null; then
-      gum style --foreground 87 "📦 已解析仓库：$candidate" >&2
+      gum style --foreground 87 "$MSG_RESOLVED_REPO: $candidate" >&2
       echo "$candidate"
       return 0
     fi
   fi
 
-  # 尝试通过 GitHub 搜索 API 查找仓库（按 star 数排序）
   local search_result
   search_result=$(gh api "search/repositories?q=${input}+in:name&sort=stars&order=desc&per_page=5" \
     --jq '.items[] | .full_name' 2>/dev/null)
 
   if [ -n "$search_result" ]; then
     local selected
-    selected=$(echo "$search_result" | gum filter --header "找到多个匹配仓库，请选择：")
+    selected=$(echo "$search_result" | gum filter --header "$MSG_MULTI_MATCH")
     if [ -n "$selected" ]; then
       echo "$selected"
       return 0
     fi
   fi
 
-  gum style --foreground 196 "错误：无法解析仓库 '$input'，请使用 owner/repo 格式" >&2
+  gum style --foreground 196 "$(printf "$MSG_ERR_RESOLVE" "$input")" >&2
   return 1
 }
 
-# 参数模式快速启动
 if [ $# -ge 1 ]; then
   repo=$(resolve_repo "$1") || exit 1
 else
-  repo_input=$(gum input --header "GitHub仓库名称" --placeholder "charmbracelet/gum")
-  [ -z "$repo_input" ] && { gum style --foreground 196 "错误：仓库名称不能为空！"; exit 1; }
+  repo_input=$(gum input --header "$MSG_INPUT_REPO" --placeholder "charmbracelet/gum")
+  [ -z "$repo_input" ] && { gum style --foreground 196 "$MSG_ERR_REPO_REQUIRED"; exit 1; }
   repo=$(resolve_repo "$repo_input") || exit 1
 fi
 
-# 版本选择
-version=$(gum spin --spinner dot --title "获取版本列表..." -- \
-    gh release list -R "$repo" --limit 50 --json tagName,name,isLatest,publishedAt --jq '.[] | "\(.tagName)  \(.publishedAt)  \(.name)  \(if .isLatest then "(Latest)" else "" end)"' | \
-    gum filter --header "按版本号或关键字筛选" | awk '{print $1}')
-[ -z "$version" ] && { gum style --foreground 196 "错误：未选择版本！"; exit 1; }
+release_list=$(gum spin --spinner dot --title "$MSG_FETCHING_RELEASES" -- \
+    gh release list -R "$repo" --limit 50 --json tagName,name,isLatest,publishedAt \
+    --jq '.[] | "\(.tagName)  \(.publishedAt)  \(.name)  \(if .isLatest then "(Latest)" else "" end)"')
 
-# 获取资源列表（含文件大小，用于校验和断点续传）
-asset_info=$(gum spin --spinner monkey --title "获取资源列表..." -- \
-    gh release view -R "$repo" "$version" --json assets --jq '.assets[] | "\(.name)\t\(.size)"')
-
-# 检查是否有资源文件
-if [ -z "$asset_info" ]; then
-  gum style --foreground 196 "错误：该版本没有可下载的资源文件！"
+if [ -z "$release_list" ]; then
+  gum style --foreground 196 "$MSG_ERR_NO_RELEASES: '$repo'"
   exit 1
 fi
 
-# 多选资源文件
+version=$(echo "$release_list" | gum filter --header "$MSG_SELECT_VERSION" | awk '{print $1}')
+[ -z "$version" ] && { gum style --foreground 196 "$MSG_ERR_NO_VERSION"; exit 1; }
+
+asset_info=$(gum spin --spinner monkey --title "$MSG_FETCHING_ASSETS" -- \
+    gh release view -R "$repo" "$version" --json assets --jq '.assets[] | "\(.name)\t\(.size)"')
+
+if [ -z "$asset_info" ]; then
+  gum style --foreground 196 "$MSG_ERR_NO_ASSETS"
+  exit 1
+fi
+
+# 选择资源文件
 assets=$(echo "$asset_info" | awk -F'\t' '{print $1}' | \
-    gum choose --no-limit --header "空格多选文件，回车确认") || {
-    gum style --foreground 196 "错误：未选择资源文件！"
-    exit 1
-}
+    gum filter --no-limit --header "$MSG_FILTER_HINT") || true
 
-# 显示已选文件
-gum style --foreground 87 --border rounded --padding "1 2" \
-    $'✅ 已选择资源文件：\n'"$(echo "${assets:-}" | awk '{print "• "$0}')"
+if [ -z "${assets:-}" ]; then
+  gum style --foreground 196 "$MSG_ERR_NO_SELECTED"
+  exit 1
+fi
 
-# 目录处理
-dir=$(gum input --header "下载路径 (回车默认当前目录)" --placeholder "./")
+selected_msg="$MSG_SELECTED"$'\n'"$(echo "${assets:-}" | awk '{print "  - "$0}')"
+echo "$selected_msg" | gum style --foreground 87 --border rounded --padding "1 2"
+
+dir=$(gum input --header "$MSG_INPUT_DIR" --placeholder "./")
 [ -z "$dir" ] && dir="$(pwd)"
-mkdir -p "$dir" 2>/dev/null || true
-[ ! -w "$dir" ] && { gum style --foreground 196 "错误：路径 '$dir' 不可写！"; exit 1; }
+if ! mkdir -p "$dir" 2>/dev/null; then
+  gum style --foreground 196 "$(printf "$MSG_ERR_MKDIR" "$dir")"
+  exit 1
+fi
+[ ! -w "$dir" ] && { gum style --foreground 196 "$(printf "$MSG_ERR_NOT_WRITABLE" "$dir")"; exit 1; }
 
-# 断点续传：检查已存在且大小一致的文件，跳过下载
+# 跳过已完整下载的文件
 skip_list=()
 download_list=()
 while IFS= read -r asset; do
@@ -111,43 +212,37 @@ while IFS= read -r asset; do
   download_list+=("$asset")
 done <<< "${assets:-}"
 
-# 显示跳过的文件
 if [ ${#skip_list[@]} -gt 0 ]; then
-  gum style --foreground 214 --border rounded --padding "1 2" \
-    $'⏭️  跳过已存在且完整的文件：\n'"$(printf '• %s\n' "${skip_list[@]}")"
+  skip_msg="$MSG_SKIPPED"$'\n'"$(printf '  - %s\n' "${skip_list[@]}")"
+  echo "$skip_msg" | gum style --foreground 214 --border rounded --padding "1 2"
 fi
 
-# 如果所有文件都已存在，直接退出
 if [ ${#download_list[@]} -eq 0 ]; then
-  gum style --foreground 212 --border rounded --padding "1 2" \
-    "✅ 所有文件已存在且完整，无需下载！"
+  echo "$MSG_ALL_EXIST" | gum style --foreground 212 --border rounded --padding "1 2"
   exit 0
 fi
 
-# 文件差异检测
-previous_files=$(find "$dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || ls -1q "$dir" 2>/dev/null | sort)
-
-# 构建下载参数（仅下载需要的文件）
+# 构建下载参数
 download_args=("-R" "$repo" "-D" "$dir" "$version" "--clobber")
 for asset in "${download_list[@]}"; do
   download_args+=("--pattern" "$asset")
 done
 
-# 执行下载并捕获错误
-trap 'gum style --foreground 214 "检测到中断，正在清理临时文件..."; exit 130' SIGINT
-if ! gum spin --spinner globe --title "下载中..." -- \
+trap 'gum style --foreground 214 "$MSG_INTERRUPTED"; exit 130' SIGINT
+if ! gum spin --spinner globe --title "$MSG_DOWNLOADING" -- \
     gh release download "${download_args[@]}"; then
 
-    gum style --foreground 196 --border rounded --padding "1 2" \
-        $'❌ 下载失败！可能原因：\n• 网络连接失败\n• 资源文件不存在\n• 磁盘空间不足（剩余：'$(df -h "$dir" | awk 'NR==2{print $4}')')'
+    disk_free=$(df -h "$dir" | awk 'NR==2{print $4}')
+    printf '%s\n' "$MSG_DL_FAILED" "$MSG_DL_NETWORK" "$MSG_DL_NOT_FOUND" "$(printf "$MSG_DL_DISK" "$disk_free")" \
+      | gum style --foreground 196 --border rounded --padding "1 2"
 
     if ! curl -m 5 -sSf https://api.github.com >/dev/null; then
-        echo -e "\n$(gum style --foreground 214 '网络诊断：GitHub API 访问失败')"
+        echo -e "\n$(gum style --foreground 214 "$MSG_DIAG_API")"
     fi
     exit 1
 fi
 
-# 文件大小校验
+# 校验文件大小
 verify_failed=()
 for asset in "${download_list[@]}"; do
   local_file="$dir/$asset"
@@ -156,14 +251,14 @@ for asset in "${download_list[@]}"; do
   if [ -f "$local_file" ] && [ -n "$expected_size" ]; then
     actual_size=$(wc -c < "$local_file" | tr -d ' ')
     if [ "$actual_size" != "$expected_size" ]; then
-      verify_failed+=("$asset (期望: ${expected_size}B, 实际: ${actual_size}B)")
+      verify_failed+=("$asset ($MSG_EXPECTED: ${expected_size}B, $MSG_ACTUAL: ${actual_size}B)")
     fi
   elif [ ! -f "$local_file" ]; then
-    verify_failed+=("$asset (文件不存在)")
+    verify_failed+=("$asset ($MSG_FILE_MISSING)")
   fi
 done
 
-# SHA256 校验：查找 release 中的 checksums 文件
+# SHA256 校验
 checksums_file=""
 all_asset_names=$(echo "$asset_info" | awk -F'\t' '{print $1}')
 match=$(echo "$all_asset_names" | grep -iE '(checksum|sha256|sha512)' | head -1 || true)
@@ -174,10 +269,9 @@ fi
 sha256_verified=0
 sha256_failed=()
 if [ -n "$checksums_file" ]; then
-  checksums_path="$dir/.checksums_tmp"
-  if gh release download -R "$repo" "$version" --pattern "$checksums_file" -D "$dir" --clobber &>/dev/null; then
-    mv "$dir/$checksums_file" "$checksums_path" 2>/dev/null || true
-
+  checksums_dir=$(mktemp -d)
+  checksums_path="$checksums_dir/$checksums_file"
+  if gh release download -R "$repo" "$version" --pattern "$checksums_file" -D "$checksums_dir" --clobber &>/dev/null; then
     for asset in "${download_list[@]}"; do
       local_file="$dir/$asset"
       expected_hash=$(grep -w "$asset" "$checksums_path" 2>/dev/null | awk '{print $1}')
@@ -190,37 +284,34 @@ if [ -n "$checksums_file" ]; then
         fi
       fi
     done
-    rm -f "$checksums_path"
   fi
+  rm -rf "$checksums_dir"
 fi
 
-# 精确统计下载数量
-current_files=$(find "$dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || ls -1q "$dir" 2>/dev/null | sort)
-downloaded_files=$(comm -13 <(echo "${previous_files:-}") <(echo "$current_files") | wc -l | tr -d ' ')
+downloaded_count=${#download_list[@]}
 
-# 结果输出美化
-result_msg="✅ 下载完成！共下载 $downloaded_files 个文件到：$(realpath "$dir")"
+result_msg="$(printf "$MSG_OK" "$downloaded_count" "$(realpath "$dir")")"
 
 if [ ${#verify_failed[@]} -gt 0 ]; then
-  result_msg+="\n\n⚠️  文件大小校验失败："
+  result_msg+="\n\n$MSG_WARN_SIZE"
   for item in "${verify_failed[@]}"; do
-    result_msg+="\n  • $item"
+    result_msg+="\n  - $item"
   done
 fi
 
 if [ ${#sha256_failed[@]} -gt 0 ]; then
-  result_msg+="\n\n❌ SHA256 校验失败："
+  result_msg+="\n\n$MSG_FAIL_SHA"
   for item in "${sha256_failed[@]}"; do
-    result_msg+="\n  • $item"
+    result_msg+="\n  - $item"
   done
 elif [ "$sha256_verified" -gt 0 ]; then
-  result_msg+="\n\n🔒 SHA256 校验通过：$sha256_verified 个文件"
+  result_msg+="\n\n$(printf "$MSG_SHA_OK" "$sha256_verified")"
 elif [ -z "$checksums_file" ]; then
-  result_msg+="\n\n📎 文件大小校验通过（该 Release 未提供 checksums 文件，已跳过 SHA256 校验）"
+  result_msg+="\n\n$MSG_SIZE_OK"
 fi
 
 if [ ${#skip_list[@]} -gt 0 ]; then
-  result_msg+="\n⏭️  跳过已存在文件：${#skip_list[@]} 个"
+  result_msg+="\n$(printf "$MSG_SKIP_COUNT" "${#skip_list[@]}")"
 fi
 
-gum style --foreground 212 --border rounded --padding "1 2" "$(echo -e "$result_msg")"
+echo -e "$result_msg" | gum style --foreground 212 --border rounded --padding "1 2"
