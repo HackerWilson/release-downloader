@@ -1,6 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
+# SHA256 计算工具兼容（macOS 用 shasum，Linux 用 sha256sum）
+compute_sha256() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum &>/dev/null; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
 # 仓库名称解析：支持 owner/repo 和 owner_repo 两种格式
 resolve_repo() {
   local input="$1"
@@ -16,15 +27,15 @@ resolve_repo() {
     local candidate="${input/_//}"
     # 通过 GitHub API 验证仓库是否存在
     if gh api "repos/$candidate" --jq '.full_name' &>/dev/null; then
-      gum style --foreground 87 "📦 已解析仓库：$candidate"
+      gum style --foreground 87 "📦 已解析仓库：$candidate" >&2
       echo "$candidate"
       return 0
     fi
   fi
 
-  # 尝试通过 GitHub 搜索 API 查找仓库
+  # 尝试通过 GitHub 搜索 API 查找仓库（按 star 数排序）
   local search_result
-  search_result=$(gh api "search/repositories?q=${input}+in:name&per_page=5" \
+  search_result=$(gh api "search/repositories?q=${input}+in:name&sort=stars&order=desc&per_page=5" \
     --jq '.items[] | .full_name' 2>/dev/null)
 
   if [ -n "$search_result" ]; then
@@ -36,7 +47,7 @@ resolve_repo() {
     fi
   fi
 
-  gum style --foreground 196 "错误：无法解析仓库 '$input'，请使用 owner/repo 格式"
+  gum style --foreground 196 "错误：无法解析仓库 '$input'，请使用 owner/repo 格式" >&2
   return 1
 }
 
@@ -59,8 +70,13 @@ version=$(gum spin --spinner dot --title "获取版本列表..." -- \
 asset_info=$(gum spin --spinner monkey --title "获取资源列表..." -- \
     gh release view -R "$repo" "$version" --json assets --jq '.assets[] | "\(.name)\t\(.size)"')
 
+# 检查是否有资源文件
+if [ -z "$asset_info" ]; then
+  gum style --foreground 196 "错误：该版本没有可下载的资源文件！"
+  exit 1
+fi
+
 # 多选资源文件
-declare -a assets
 assets=$(echo "$asset_info" | awk -F'\t' '{print $1}' | \
     gum choose --no-limit --header "空格多选文件，回车确认") || {
     gum style --foreground 196 "错误：未选择资源文件！"
@@ -109,7 +125,7 @@ if [ ${#download_list[@]} -eq 0 ]; then
 fi
 
 # 文件差异检测
-previous_files=$(ls -1q "$dir" 2>/dev/null | sort)
+previous_files=$(find "$dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || ls -1q "$dir" 2>/dev/null | sort)
 
 # 构建下载参数（仅下载需要的文件）
 download_args=("-R" "$repo" "-D" "$dir" "$version" "--clobber")
@@ -118,7 +134,7 @@ for asset in "${download_list[@]}"; do
 done
 
 # 执行下载并捕获错误
-trap 'gum style --foreground 214 "检测到中断，正在清理临时文件..."' SIGINT
+trap 'gum style --foreground 214 "检测到中断，正在清理临时文件..."; exit 130' SIGINT
 if ! gum spin --spinner globe --title "下载中..." -- \
     gh release download "${download_args[@]}"; then
 
@@ -149,20 +165,15 @@ done
 
 # SHA256 校验：查找 release 中的 checksums 文件
 checksums_file=""
-checksums_patterns=("checksums.txt" "SHA256SUMS" "sha256sums.txt" "CHECKSUMS" "checksums" "sha256sum.txt")
 all_asset_names=$(echo "$asset_info" | awk -F'\t' '{print $1}')
-for pattern in "${checksums_patterns[@]}"; do
-  match=$(echo "$all_asset_names" | grep -i "$pattern" | head -1)
-  if [ -n "$match" ]; then
-    checksums_file="$match"
-    break
-  fi
-done
+match=$(echo "$all_asset_names" | grep -iE '(checksum|sha256|sha512)' | head -1 || true)
+if [ -n "$match" ]; then
+  checksums_file="$match"
+fi
 
 sha256_verified=0
 sha256_failed=()
 if [ -n "$checksums_file" ]; then
-  # 下载 checksums 文件
   checksums_path="$dir/.checksums_tmp"
   if gh release download -R "$repo" "$version" --pattern "$checksums_file" -D "$dir" --clobber &>/dev/null; then
     mv "$dir/$checksums_file" "$checksums_path" 2>/dev/null || true
@@ -171,10 +182,10 @@ if [ -n "$checksums_file" ]; then
       local_file="$dir/$asset"
       expected_hash=$(grep -w "$asset" "$checksums_path" 2>/dev/null | awk '{print $1}')
       if [ -n "$expected_hash" ] && [ -f "$local_file" ]; then
-        actual_hash=$(shasum -a 256 "$local_file" | awk '{print $1}')
-        if [ "$actual_hash" = "$expected_hash" ]; then
+        actual_hash=$(compute_sha256 "$local_file")
+        if [ -n "$actual_hash" ] && [ "$actual_hash" = "$expected_hash" ]; then
           sha256_verified=$((sha256_verified + 1))
-        else
+        elif [ -n "$actual_hash" ]; then
           sha256_failed+=("$asset")
         fi
       fi
@@ -184,12 +195,12 @@ if [ -n "$checksums_file" ]; then
 fi
 
 # 精确统计下载数量
-downloaded_files=$(comm -13 <(echo "${previous_files:-}") <(ls -1q "$dir" | sort) | wc -l | tr -d ' ')
+current_files=$(find "$dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || ls -1q "$dir" 2>/dev/null | sort)
+downloaded_files=$(comm -13 <(echo "${previous_files:-}") <(echo "$current_files") | wc -l | tr -d ' ')
 
 # 结果输出美化
 result_msg="✅ 下载完成！共下载 $downloaded_files 个文件到：$(realpath "$dir")"
 
-# 显示校验结果
 if [ ${#verify_failed[@]} -gt 0 ]; then
   result_msg+="\n\n⚠️  文件大小校验失败："
   for item in "${verify_failed[@]}"; do
